@@ -1,13 +1,14 @@
 {
     "plugins": [
-        "transform-flow-strip-types",
-        "transform-object-rest-spread"
+        "@babel/plugin-transform-flow-strip-types",
+        "@babel/plugin-proposal-object-rest-spread"
     ],
     "presets": [
-        ["env", {
+        ["@babel/preset-env", {
             "targets": {
-                "node": "8"
+                "node": "12"
             }
         }]
-    ]
+    ],
+    "sourceMaps": "inline"
 }

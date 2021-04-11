@@ -5,7 +5,7 @@ import cluster from 'cluster';
 import os from 'os';
 import runner from './utils/runner';
 
-const help = function(){
+const help = function () {
   console.log('  Get Started guide:');
   console.log('');
   console.log('    Please have a look at the get started guide!');
@@ -31,31 +31,36 @@ runner({
   definitions,
   help,
   usage: '[options] <path/to/configuration.json>',
-  start: function(program, options, logOptions) {
+  start: function (program, options, logOptions) {
     if (!options.appId || !options.masterKey) {
       program.outputHelp();
-      console.error("");
+      console.error('');
       console.error('\u001b[31mERROR: appId and masterKey are required\u001b[0m');
-      console.error("");
+      console.error('');
       process.exit(1);
     }
 
-    if (options["liveQuery.classNames"]) {
+    if (options['liveQuery.classNames']) {
       options.liveQuery = options.liveQuery || {};
-      options.liveQuery.classNames = options["liveQuery.classNames"];
-      delete options["liveQuery.classNames"];
+      options.liveQuery.classNames = options['liveQuery.classNames'];
+      delete options['liveQuery.classNames'];
     }
-    if (options["liveQuery.redisURL"]) {
+    if (options['liveQuery.redisURL']) {
       options.liveQuery = options.liveQuery || {};
-      options.liveQuery.redisURL = options["liveQuery.redisURL"];
-      delete options["liveQuery.redisURL"];
+      options.liveQuery.redisURL = options['liveQuery.redisURL'];
+      delete options['liveQuery.redisURL'];
+    }
+    if (options['liveQuery.redisOptions']) {
+      options.liveQuery = options.liveQuery || {};
+      options.liveQuery.redisOptions = options['liveQuery.redisOptions'];
+      delete options['liveQuery.redisOptions'];
     }
 
     if (options.cluster) {
       const numCPUs = typeof options.cluster === 'number' ? options.cluster : os.cpus().length;
       if (cluster.isMaster) {
         logOptions();
-        for(let i = 0; i < numCPUs; i++) {
+        for (let i = 0; i < numCPUs; i++) {
           cluster.fork();
         }
         cluster.on('exit', (worker, code) => {
@@ -64,17 +69,39 @@ runner({
         });
       } else {
         ParseServer.start(options, () => {
-          console.log('[' + process.pid + '] parse-server running on ' + options.serverURL);
+          printSuccessMessage();
         });
       }
     } else {
       ParseServer.start(options, () => {
         logOptions();
         console.log('');
-        console.log('[' + process.pid + '] parse-server running on ' + options.serverURL);
+        printSuccessMessage();
       });
     }
-  }
+
+    function printSuccessMessage() {
+      console.log('[' + process.pid + '] parse-server running on ' + options.serverURL);
+      if (options.mountGraphQL) {
+        console.log(
+          '[' +
+            process.pid +
+            '] GraphQL running on http://localhost:' +
+            options.port +
+            options.graphQLPath
+        );
+      }
+      if (options.mountPlayground) {
+        console.log(
+          '[' +
+            process.pid +
+            '] Playground running on http://localhost:' +
+            options.port +
+            options.playgroundPath
+        );
+      }
+    }
+  },
 });
 
 /* eslint-enable no-console */

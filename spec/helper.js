@@ -1,10 +1,12 @@
-"use strict"
+'use strict';
+const semver = require('semver');
+const CurrentSpecReporter = require('./support/CurrentSpecReporter.js');
+const { SpecReporter } = require('jasmine-spec-reporter');
+const SchemaCache = require('../lib/Adapters/Cache/SchemaCache').default;
+
 // Sets up a Parse API server for testing.
-const SpecReporter = require('jasmine-spec-reporter').SpecReporter;
-
-jasmine.DEFAULT_TIMEOUT_INTERVAL = process.env.PARSE_SERVER_TEST_TIMEOUT || 5000;
-
-jasmine.getEnv().clearReporters();
+jasmine.DEFAULT_TIMEOUT_INTERVAL = process.env.PARSE_SERVER_TEST_TIMEOUT || 10000;
+jasmine.getEnv().addReporter(new CurrentSpecReporter());
 jasmine.getEnv().addReporter(new SpecReporter());
 
 global.on_db = (db, callback, elseCallback) => {
@@ -16,30 +18,33 @@ global.on_db = (db, callback, elseCallback) => {
   if (elseCallback) {
     return elseCallback();
   }
-}
+};
 
 if (global._babelPolyfill) {
   console.error('We should not use polyfilled tests');
   process.exit(1);
 }
+process.noDeprecation = true;
 
-const cache = require('../src/cache').default;
-const ParseServer = require('../src/index').ParseServer;
+const cache = require('../lib/cache').default;
+const defaults = require('../lib/defaults').default;
+const ParseServer = require('../lib/index').ParseServer;
 const path = require('path');
-const TestUtils = require('../src/TestUtils');
-const GridStoreAdapter = require('../src/Adapters/Files/GridStoreAdapter').GridStoreAdapter;
+const TestUtils = require('../lib/TestUtils');
+const GridFSBucketAdapter = require('../lib/Adapters/Files/GridFSBucketAdapter')
+  .GridFSBucketAdapter;
 const FSAdapter = require('@parse/fs-files-adapter');
-import PostgresStorageAdapter from '../src/Adapters/Storage/Postgres/PostgresStorageAdapter';
-import MongoStorageAdapter from '../src/Adapters/Storage/Mongo/MongoStorageAdapter';
-const RedisCacheAdapter = require('../src/Adapters/Cache/RedisCacheAdapter').default;
+const PostgresStorageAdapter = require('../lib/Adapters/Storage/Postgres/PostgresStorageAdapter')
+  .default;
+const MongoStorageAdapter = require('../lib/Adapters/Storage/Mongo/MongoStorageAdapter').default;
+const RedisCacheAdapter = require('../lib/Adapters/Cache/RedisCacheAdapter').default;
+const RESTController = require('parse/lib/node/RESTController');
+const { VolatileClassesSchemas } = require('../lib/Controllers/SchemaController');
 
 const mongoURI = 'mongodb://localhost:27017/parseServerMongoAdapterTestDatabase';
 const postgresURI = 'postgres://localhost:5432/parse_server_postgres_adapter_test_database';
 let databaseAdapter;
 // need to bind for mocking mocha
-
-let startDB = () => {};
-let stopDB = () => {};
 
 if (process.env.PARSE_SERVER_TEST_DB === 'postgres') {
   databaseAdapter = new PostgresStorageAdapter({
@@ -47,11 +52,6 @@ if (process.env.PARSE_SERVER_TEST_DB === 'postgres') {
     collectionPrefix: 'test_',
   });
 } else {
-  startDB = require('mongodb-runner/mocha/before').bind({
-    timeout: () => {},
-    slow: () => {}
-  })
-  stopDB = require('mongodb-runner/mocha/after');
   databaseAdapter = new MongoStorageAdapter({
     uri: mongoURI,
     collectionPrefix: 'test_',
@@ -62,11 +62,15 @@ const port = 8378;
 
 let filesAdapter;
 
-on_db('mongo', () => {
-  filesAdapter = new GridStoreAdapter(mongoURI);
-}, () => {
-  filesAdapter = new FSAdapter();
-});
+on_db(
+  'mongo',
+  () => {
+    filesAdapter = new GridFSBucketAdapter(mongoURI);
+  },
+  () => {
+    filesAdapter = new FSAdapter();
+  }
+);
 
 let logLevel;
 let silent = true;
@@ -92,21 +96,29 @@ const defaultConfiguration = {
   masterKey: 'test',
   readOnlyMasterKey: 'read-only-test',
   fileKey: 'test',
+  directAccess: false,
   silent,
   logLevel,
+  fileUpload: {
+    enableForPublic: true,
+    enableForAnonymousUser: true,
+    enableForAuthenticatedUser: true,
+  },
   push: {
     android: {
       senderId: 'yolo',
       apiKey: 'yolo',
-    }
+    },
   },
-  auth: { // Override the facebook provider
+  auth: {
+    // Override the facebook provider
+    custom: mockCustom(),
     facebook: mockFacebook(),
     myoauth: {
-      module: path.resolve(__dirname, "myoauth") // relative path as it's run from src
+      module: path.resolve(__dirname, 'support/myoauth'), // relative path as it's run from src
     },
-    shortLivedAuth: mockShortLivedAuth()
-  }
+    shortLivedAuth: mockShortLivedAuth(),
+  },
 };
 
 if (process.env.PARSE_SERVER_TEST_CACHE === 'redis') {
@@ -114,12 +126,23 @@ if (process.env.PARSE_SERVER_TEST_CACHE === 'redis') {
 }
 
 const openConnections = {};
-
+const destroyAliveConnections = function () {
+  for (const socketId in openConnections) {
+    try {
+      openConnections[socketId].destroy();
+      delete openConnections[socketId];
+    } catch (e) {
+      /* */
+    }
+  }
+};
 // Set up a default API server for testing with default configuration.
 let server;
 
+let didChangeConfiguration = false;
+
 // Allows testing specific configurations of Parse Server
-const reconfigureServer = changedConfiguration => {
+const reconfigureServer = (changedConfiguration = {}) => {
   return new Promise((resolve, reject) => {
     if (server) {
       return server.close(() => {
@@ -128,15 +151,23 @@ const reconfigureServer = changedConfiguration => {
       });
     }
     try {
+      let parseServer = undefined;
+      didChangeConfiguration = Object.keys(changedConfiguration).length !== 0;
       const newConfiguration = Object.assign({}, defaultConfiguration, changedConfiguration, {
-        __indexBuildCompletionCallbackForTests: indexBuildPromise => indexBuildPromise.then(resolve, reject),
+        serverStartComplete: error => {
+          if (error) {
+            reject(error);
+          } else {
+            Parse.CoreManager.setRESTController(RESTController);
+            resolve(parseServer);
+          }
+        },
         mountPath: '/1',
         port,
       });
       cache.clear();
-      const parseServer = ParseServer.start(newConfiguration);
-      parseServer.app.use(require('./testing-routes').router);
-      parseServer.expressApp.use('/1', (err) => {
+      parseServer = ParseServer.start(newConfiguration);
+      parseServer.expressApp.use('/1', err => {
         console.error(err);
         fail('should not call next');
       });
@@ -144,28 +175,21 @@ const reconfigureServer = changedConfiguration => {
       server.on('connection', connection => {
         const key = `${connection.remoteAddress}:${connection.remotePort}`;
         openConnections[key] = connection;
-        connection.on('close', () => { delete openConnections[key] });
+        connection.on('close', () => {
+          delete openConnections[key];
+        });
       });
-    } catch(error) {
+    } catch (error) {
       reject(error);
     }
   });
-}
+};
 
 // Set up a Parse client to talk to our test API server
 const Parse = require('parse/node');
 Parse.serverURL = 'http://localhost:' + port + '/1';
 
-// This is needed because we ported a bunch of tests from the non-A+ way.
-// TODO: update tests to work in an A+ way
-Parse.Promise.disableAPlusCompliant();
-
-// 10 minutes timeout
-beforeAll(startDB, 10 * 60 * 1000);
-
-afterAll(stopDB);
-
-beforeEach(done => {
+beforeAll(async () => {
   try {
     Parse.User.enableUnsafeCurrentUser();
   } catch (error) {
@@ -173,94 +197,92 @@ beforeEach(done => {
       throw error;
     }
   }
-  TestUtils.destroyAllDataPermanently()
-    .catch(error => {
-    // For tests that connect to their own mongo, there won't be any data to delete.
-      if (error.message === 'ns not found' || error.message.startsWith('connect ECONNREFUSED')) {
-        return;
-      } else {
-        fail(error);
-        return;
-      }
-    })
-    .then(reconfigureServer)
-    .then(() => {
-      Parse.initialize('test', 'test', 'test');
-      Parse.serverURL = 'http://localhost:' + port + '/1';
-      done();
-    }).catch(done.fail);
+  await reconfigureServer();
+
+  Parse.initialize('test', 'test', 'test');
+  Parse.serverURL = 'http://localhost:' + port + '/1';
 });
 
-afterEach(function(done) {
-  const afterLogOut = () => {
+afterEach(function (done) {
+  const afterLogOut = async () => {
     if (Object.keys(openConnections).length > 0) {
-      fail('There were open connections to the server left after the test finished');
+      console.warn('There were open connections to the server left after the test finished');
     }
-    on_db('postgres', () => {
-      TestUtils.destroyAllDataPermanently().then(done, done);
-    }, done);
+    destroyAliveConnections();
+    await TestUtils.destroyAllDataPermanently(true);
+    SchemaCache.clear();
+    if (didChangeConfiguration) {
+      await reconfigureServer();
+    } else {
+      await databaseAdapter.performInitialization({ VolatileClassesSchemas });
+    }
+    done();
   };
   Parse.Cloud._removeAllHooks();
-  databaseAdapter.getAllClasses()
+  defaults.protectedFields = { _User: { '*': ['email'] } };
+  databaseAdapter
+    .getAllClasses()
     .then(allSchemas => {
-      allSchemas.forEach((schema) => {
+      allSchemas.forEach(schema => {
         const className = schema.className;
-        expect(className).toEqual({ asymmetricMatch: className => {
-          if (!className.startsWith('_')) {
-            return true;
-          } else {
-          // Other system classes will break Parse.com, so make sure that we don't save anything to _SCHEMA that will
-          // break it.
-            return ['_User', '_Installation', '_Role', '_Session', '_Product', '_Audience'].indexOf(className) >= 0;
-          }
-        }});
+        expect(className).toEqual({
+          asymmetricMatch: className => {
+            if (!className.startsWith('_')) {
+              return true;
+            } else {
+              // Other system classes will break Parse.com, so make sure that we don't save anything to _SCHEMA that will
+              // break it.
+              return (
+                [
+                  '_User',
+                  '_Installation',
+                  '_Role',
+                  '_Session',
+                  '_Product',
+                  '_Audience',
+                  '_Idempotency',
+                ].indexOf(className) >= 0
+              );
+            }
+          },
+        });
       });
     })
     .then(() => Parse.User.logOut())
-    .then(() => {}, () => {}) // swallow errors
+    .then(
+      () => {},
+      () => {}
+    ) // swallow errors
     .then(() => {
       // Connection close events are not immediate on node 10+... wait a bit
-      return new Promise((resolve) => {
+      return new Promise(resolve => {
         setTimeout(resolve, 0);
       });
     })
-    .then(afterLogOut)
+    .then(afterLogOut);
 });
 
 const TestObject = Parse.Object.extend({
-  className: "TestObject"
+  className: 'TestObject',
 });
 const Item = Parse.Object.extend({
-  className: "Item"
+  className: 'Item',
 });
 const Container = Parse.Object.extend({
-  className: "Container"
+  className: 'Container',
 });
 
 // Convenience method to create a new TestObject with a callback
 function create(options, callback) {
   const t = new TestObject(options);
-  t.save(null, { success: callback });
+  return t.save().then(callback);
 }
 
-function createTestUser(success, error) {
+function createTestUser() {
   const user = new Parse.User();
   user.set('username', 'test');
   user.set('password', 'moon-y');
-  const promise = user.signUp();
-  if (success || error) {
-    promise.then(function(user) {
-      if (success) {
-        success(user);
-      }
-    }, function(err) {
-      if (error) {
-        error(err);
-      }
-    });
-  } else {
-    return promise;
-  }
+  return user.signUp();
 }
 
 // Shims for compatibility with the old qunit tests.
@@ -275,35 +297,6 @@ function strictEqual(a, b, message) {
 }
 function notEqual(a, b, message) {
   expect(a).not.toEqual(b, message);
-}
-function expectSuccess(params, done) {
-  return {
-    success: params.success,
-    error: function() {
-      fail('failure happened in expectSuccess');
-      done ? done() : null;
-    },
-  }
-}
-function expectError(errorCode, callback) {
-  return {
-    success: function(result) {
-      console.log('got result', result);
-      fail('expected error but got success');
-    },
-    error: function(obj, e) {
-      // Some methods provide 2 parameters.
-      e = e || obj;
-      if (!e) {
-        fail('expected a specific error but got a blank error');
-        return;
-      }
-      expect(e.code).toEqual(errorCode, e.message);
-      if (callback) {
-        callback(e);
-      }
-    },
-  }
 }
 
 // Because node doesn't have Parse._.contains
@@ -342,16 +335,34 @@ function range(n) {
   return answer;
 }
 
+function mockCustomAuthenticator(id, password) {
+  const custom = {};
+  custom.validateAuthData = function (authData) {
+    if (authData.id === id && authData.password.startsWith(password)) {
+      return Promise.resolve();
+    }
+    throw new Parse.Error(Parse.Error.OBJECT_NOT_FOUND, 'not validated');
+  };
+  custom.validateAppId = function () {
+    return Promise.resolve();
+  };
+  return custom;
+}
+
+function mockCustom() {
+  return mockCustomAuthenticator('fastrde', 'password');
+}
+
 function mockFacebookAuthenticator(id, token) {
   const facebook = {};
-  facebook.validateAuthData = function(authData) {
+  facebook.validateAuthData = function (authData) {
     if (authData.id === id && authData.access_token.startsWith(token)) {
       return Promise.resolve();
     } else {
       throw undefined;
     }
   };
-  facebook.validateAppId = function(appId, authData) {
+  facebook.validateAppId = function (appId, authData) {
     if (authData.access_token.startsWith(token)) {
       return Promise.resolve();
     } else {
@@ -368,22 +379,21 @@ function mockFacebook() {
 function mockShortLivedAuth() {
   const auth = {};
   let accessToken;
-  auth.setValidAccessToken = function(validAccessToken) {
+  auth.setValidAccessToken = function (validAccessToken) {
     accessToken = validAccessToken;
-  }
-  auth.validateAuthData = function(authData) {
+  };
+  auth.validateAuthData = function (authData) {
     if (authData.access_token == accessToken) {
       return Promise.resolve();
     } else {
       return Promise.reject('Invalid access token');
     }
   };
-  auth.validateAppId = function() {
+  auth.validateAppId = function () {
     return Promise.resolve();
   };
   return auth;
 }
-
 
 // This is polluting, but, it makes it way easier to directly port old tests.
 global.Parse = Parse;
@@ -396,17 +406,17 @@ global.ok = ok;
 global.equal = equal;
 global.strictEqual = strictEqual;
 global.notEqual = notEqual;
-global.expectSuccess = expectSuccess;
-global.expectError = expectError;
 global.arrayContains = arrayContains;
 global.jequal = jequal;
 global.range = range;
 global.reconfigureServer = reconfigureServer;
 global.defaultConfiguration = defaultConfiguration;
+global.mockCustomAuthenticator = mockCustomAuthenticator;
 global.mockFacebookAuthenticator = mockFacebookAuthenticator;
-global.jfail = function(err) {
+global.databaseAdapter = databaseAdapter;
+global.jfail = function (err) {
   fail(JSON.stringify(err));
-}
+};
 
 global.it_exclude_dbs = excluded => {
   if (excluded.indexOf(process.env.PARSE_SERVER_TEST_DB) >= 0) {
@@ -414,11 +424,50 @@ global.it_exclude_dbs = excluded => {
   } else {
     return it;
   }
-}
+};
 
 global.it_only_db = db => {
-  if (process.env.PARSE_SERVER_TEST_DB === db) {
+  if (
+    process.env.PARSE_SERVER_TEST_DB === db ||
+    (!process.env.PARSE_SERVER_TEST_DB && db == 'mongo')
+  ) {
     return it;
+  } else {
+    return xit;
+  }
+};
+
+global.it_only_mongodb_version = version => {
+  const envVersion = process.env.MONGODB_VERSION;
+  if (!envVersion || semver.satisfies(envVersion, version)) {
+    return it;
+  } else {
+    return xit;
+  }
+};
+
+global.fit_only_mongodb_version = version => {
+  const envVersion = process.env.MONGODB_VERSION;
+  if (!envVersion || semver.satisfies(envVersion, version)) {
+    return fit;
+  } else {
+    return xit;
+  }
+};
+
+global.it_exclude_mongodb_version = version => {
+  const envVersion = process.env.MONGODB_VERSION;
+  if (!envVersion || !semver.satisfies(envVersion, version)) {
+    return it;
+  } else {
+    return xit;
+  }
+};
+
+global.fit_exclude_mongodb_version = version => {
+  const envVersion = process.env.MONGODB_VERSION;
+  if (!envVersion || !semver.satisfies(envVersion, version)) {
+    return fit;
   } else {
     return xit;
   }
@@ -430,7 +479,7 @@ global.fit_exclude_dbs = excluded => {
   } else {
     return fit;
   }
-}
+};
 
 global.describe_only_db = db => {
   if (process.env.PARSE_SERVER_TEST_DB == db) {
@@ -438,11 +487,11 @@ global.describe_only_db = db => {
   } else if (!process.env.PARSE_SERVER_TEST_DB && db == 'mongo') {
     return describe;
   } else {
-    return () => {};
+    return xdescribe;
   }
-}
+};
 
-global.describe_only = (validator) =>{
+global.describe_only = validator => {
   if (validator()) {
     return describe;
   } else {
@@ -450,20 +499,19 @@ global.describe_only = (validator) =>{
   }
 };
 
-
 const libraryCache = {};
-jasmine.mockLibrary = function(library, name, mock) {
+jasmine.mockLibrary = function (library, name, mock) {
   const original = require(library)[name];
   if (!libraryCache[library]) {
     libraryCache[library] = {};
   }
   require(library)[name] = mock;
   libraryCache[library][name] = original;
-}
+};
 
-jasmine.restoreLibrary = function(library, name) {
+jasmine.restoreLibrary = function (library, name) {
   if (!libraryCache[library] || !libraryCache[library][name]) {
     throw 'Can not find library ' + library + ' ' + name;
   }
   require(library)[name] = libraryCache[library][name];
-}
+};
